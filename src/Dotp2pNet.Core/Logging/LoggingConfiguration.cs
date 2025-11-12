@@ -1,3 +1,6 @@
+using Serilog;
+using Serilog.Events;
+
 namespace Dotp2pNet.Core.Logging;
 
 /// <summary>
@@ -6,7 +9,7 @@ namespace Dotp2pNet.Core.Logging;
 public static class LoggingConfiguration
 {
     /// <summary>
-    ///   ///es the global Serilog logger with console and file sinks.
+    /// Configures the global Serilog logger with console and file sinks.
     /// </summary>
     /// <param name="logDirectory">Directory where log files will be stored. Defaults to ~/.dotp2pnet/logs/</param>
     /// <param name="minimumLevel">Minimum log level. Defaults to Information.</param>

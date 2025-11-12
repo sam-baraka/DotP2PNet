@@ -127,7 +127,7 @@ public class PeerConfiguration
     /// <summary>
     /// Request timeout in seconds.
     /// </summary>
-    /// public int RequestTimeoutSecond; } = 30;
+    public int RequestTimeoutSeconds { get; set; } = 30;
 
     /// <summary>
     /// Enable choking algorithm (bandwidth management).
