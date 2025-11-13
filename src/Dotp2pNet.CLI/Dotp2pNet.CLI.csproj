@@ -13,4 +13,9 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\Dotp2pNet.Core\Dotp2pNet.Core.csproj" />
+    <ProjectReference Include="..\Dotp2pNet.Networking\Dotp2pNet.Networking.csproj" />
+  </ItemGroup>
+
 </Project>
