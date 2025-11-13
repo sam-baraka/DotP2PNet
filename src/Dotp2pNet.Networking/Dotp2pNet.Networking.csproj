@@ -6,4 +6,8 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\Dotp2pNet.Core\Dotp2pNet.Core.csproj" />
+  </ItemGroup>
+
 </Project>
