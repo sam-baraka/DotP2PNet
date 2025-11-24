@@ -87,7 +87,7 @@ public class StateManager : IStateManager
             throw new ArgumentException("Download directory cannot be empty", nameof(downloadDirectory));
         }
 
-        await _writeLock.WaitAsync(ct);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             // Create download state object
@@ -111,7 +111,7 @@ public class StateManager : IStateManager
 
             // Write to file atomically (write to temp file, then rename)
             var tempFilePath = stateFilePath + ".tmp";
-            await File.WriteAllTextAsync(tempFilePath, json, ct);
+            await File.WriteAllTextAsync(tempFilePath, json, ct).ConfigureAwait(false);
 
             // Atomic rename (overwrites existing file)
             File.Move(tempFilePath, stateFilePath, overwrite: true);
@@ -158,7 +158,7 @@ public class StateManager : IStateManager
         try
         {
             // Read JSON from file
-            var json = await File.ReadAllTextAsync(stateFilePath, ct);
+            var json = await File.ReadAllTextAsync(stateFilePath, ct).ConfigureAwait(false);
 
             // Deserialize
             var state = JsonSerializer.Deserialize<DownloadState>(json, _jsonOptions);
@@ -216,7 +216,7 @@ public class StateManager : IStateManager
             return;
         }
 
-        await _writeLock.WaitAsync(ct);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             File.Delete(stateFilePath);

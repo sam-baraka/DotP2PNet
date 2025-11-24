@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
+using System.Collections.Concurrent;
 using Dotp2pNet.Core.Interfaces;
 using Dotp2pNet.Core.Models;
+using Dotp2pNet.Core.Concurrency;
 using Microsoft.Extensions.Logging;
 
 namespace Dotp2pNet.Storage.Pieces;
@@ -15,6 +17,11 @@ namespace Dotp2pNet.Storage.Pieces;
 /// - Writing received pieces to disk with async I/O
 /// - Reading pieces from disk for uploading to peers
 /// - Verifying piece integrity using cryptographic hashes
+/// 
+/// Thread Safety:
+/// - Uses keyed semaphore to ensure only one write per piece at a time
+/// - Uses ConcurrentDictionary for piece cache
+/// - Bitfield operations are thread-safe via IBitfield implementation
 /// </remarks>
 public class PieceManager : IPieceManager
 {
@@ -22,9 +29,9 @@ public class PieceManager : IPieceManager
     private readonly IBitfield _bitfield;
     private readonly TorrentMetadata _metadata;
     private readonly string _downloadDirectory;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private readonly Dictionary<int, byte[]> _pieceCache = new();
-    private readonly object _cacheLock = new();
+    private readonly AsyncHelper.KeyedSemaphore<int> _pieceWriteLocks = new(1);
+    private readonly ConcurrentDictionary<int, byte[]> _pieceCache = new();
+    private readonly SemaphoreSlim _fileAccessLock = new(1, 1);
 
     public int TotalPieces => _metadata.PieceCount;
     public int CompletedPieces => _bitfield.CountSetBits();
@@ -189,30 +196,52 @@ public class PieceManager : IPieceManager
             throw new ArgumentNullException(nameof(data));
         }
 
-        // Verify piece hash before storing
-        if (!await VerifyPieceAsync(pieceIndex, data, ct))
+        // Check if we already have this piece (avoid duplicate writes)
+        if (_bitfield.HasPiece(pieceIndex))
         {
-            _logger.LogWarning(
-                "Piece {PieceIndex} failed hash verification. Expected: {ExpectedHash}, Got: {ActualHash}",
-                pieceIndex,
-                Convert.ToHexString(_metadata.PieceHashes[pieceIndex]),
-                Convert.ToHexString(SHA256.HashData(data)));
-            return false;
+            _logger.LogDebug("Piece {PieceIndex} already stored, skipping duplicate write", pieceIndex);
+            return true;
         }
 
-        // Write piece to disk
-        await WritePieceAsync(pieceIndex, data, ct);
+        // Use keyed semaphore to ensure only one write per piece at a time
+        // This prevents race conditions when multiple peers send the same piece
+        using (await _pieceWriteLocks.LockAsync(pieceIndex, ct).ConfigureAwait(false))
+        {
+            // Double-check after acquiring lock
+            if (_bitfield.HasPiece(pieceIndex))
+            {
+                _logger.LogDebug("Piece {PieceIndex} was stored by another operation, skipping", pieceIndex);
+                return true;
+            }
 
-        // Mark piece as complete in bitfield
-        _bitfield.SetPiece(pieceIndex);
+            // Verify piece hash before storing
+            if (!await VerifyPieceAsync(pieceIndex, data, ct).ConfigureAwait(false))
+            {
+                _logger.LogWarning(
+                    "Piece {PieceIndex} failed hash verification. Expected: {ExpectedHash}, Got: {ActualHash}",
+                    pieceIndex,
+                    Convert.ToHexString(_metadata.PieceHashes[pieceIndex]),
+                    Convert.ToHexString(SHA256.HashData(data)));
+                return false;
+            }
 
-        _logger.LogInformation(
-            "Successfully stored piece {PieceIndex}/{TotalPieces} ({Progress:F2}%)",
-            pieceIndex,
-            TotalPieces,
-            (CompletedPieces * 100.0) / TotalPieces);
+            // Write piece to disk
+            await WritePieceAsync(pieceIndex, data, ct).ConfigureAwait(false);
 
-        return true;
+            // Mark piece as complete in bitfield (atomic operation)
+            _bitfield.SetPiece(pieceIndex);
+
+            // Add to cache
+            _pieceCache.TryAdd(pieceIndex, data);
+
+            _logger.LogInformation(
+                "Successfully stored piece {PieceIndex}/{TotalPieces} ({Progress:F2}%)",
+                pieceIndex,
+                TotalPieces,
+                (CompletedPieces * 100.0) / TotalPieces);
+
+            return true;
+        }
     }
 
     public async Task<byte[]> GetPieceAsync(int pieceIndex, CancellationToken ct)
@@ -227,27 +256,18 @@ public class PieceManager : IPieceManager
             throw new InvalidOperationException($"Piece {pieceIndex} is not available");
         }
 
-        // Check cache first
-        lock (_cacheLock)
+        // Check cache first (thread-safe with ConcurrentDictionary)
+        if (_pieceCache.TryGetValue(pieceIndex, out var cachedData))
         {
-            if (_pieceCache.TryGetValue(pieceIndex, out var cachedData))
-            {
-                _logger.LogDebug("Piece {PieceIndex} retrieved from cache", pieceIndex);
-                return cachedData;
-            }
+            _logger.LogDebug("Piece {PieceIndex} retrieved from cache", pieceIndex);
+            return cachedData;
         }
 
         // Read from disk
-        var data = await ReadPieceAsync(pieceIndex, ct);
+        var data = await ReadPieceAsync(pieceIndex, ct).ConfigureAwait(false);
 
-        // Add to cache (simple cache, no eviction for now)
-        lock (_cacheLock)
-        {
-            if (!_pieceCache.ContainsKey(pieceIndex))
-            {
-                _pieceCache[pieceIndex] = data;
-            }
-        }
+        // Add to cache (thread-safe with ConcurrentDictionary)
+        _pieceCache.TryAdd(pieceIndex, data);
 
         return data;
     }
@@ -265,7 +285,8 @@ public class PieceManager : IPieceManager
     /// <param name="ct">Cancellation token.</param>
     private async Task WritePieceAsync(int pieceIndex, byte[] data, CancellationToken ct)
     {
-        await _writeLock.WaitAsync(ct);
+        // Use file access lock to prevent concurrent file operations
+        await _fileAccessLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             // For single-file torrents, write directly to the file
@@ -292,8 +313,8 @@ public class PieceManager : IPieceManager
             fileStream.Seek(fileOffset, SeekOrigin.Begin);
 
             // Write the piece data
-            await fileStream.WriteAsync(data, ct);
-            await fileStream.FlushAsync(ct);
+            await fileStream.WriteAsync(data, ct).ConfigureAwait(false);
+            await fileStream.FlushAsync(ct).ConfigureAwait(false);
 
             _logger.LogDebug(
                 "Wrote piece {PieceIndex} to {FilePath} at offset {Offset} ({Size} bytes)",
@@ -304,13 +325,13 @@ public class PieceManager : IPieceManager
         }
         finally
         {
-            _writeLock.Release();
+            _fileAccessLock.Release();
         }
     }
 
     /// <summary>
     /// Reads a piece from disk.
-    ///   /ummary>
+    /// </summary>
     /// <param name="pieceIndex">Index of the piece to read.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>Piece data.</returns>
@@ -330,34 +351,43 @@ public class PieceManager : IPieceManager
             throw new FileNotFoundException($"File not found: {filePath}");
         }
 
-        using var fileStream = new FileStream(
-            filePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: 81920,
-            useAsync: true);
-
-        // Seek to the correct position
-        fileStream.Seek(fileOffset, SeekOrigin.Begin);
-
-        // Read the piece data
-        var buffer = new byte[pieceSize];
-        var bytesRead = await fileStream.ReadAsync(buffer, ct);
-
-        if (bytesRead != pieceSize)
+        // Use file access lock for read operations too (prevents read during write)
+        await _fileAccessLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            throw new IOException($"Failed to read expected bytes. Expected: {pieceSize}, Read: {bytesRead}");
+            using var fileStream = new FileStream(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 81920,
+                useAsync: true);
+
+            // Seek to the correct position
+            fileStream.Seek(fileOffset, SeekOrigin.Begin);
+
+            // Read the piece data
+            var buffer = new byte[pieceSize];
+            var bytesRead = await fileStream.ReadAsync(buffer, ct).ConfigureAwait(false);
+
+            if (bytesRead != pieceSize)
+            {
+                throw new IOException($"Failed to read expected bytes. Expected: {pieceSize}, Read: {bytesRead}");
+            }
+
+            _logger.LogDebug(
+                "Read piece {PieceIndex} from {FilePath} at offset {Offset} ({Size} bytes)",
+                pieceIndex,
+                filePath,
+                fileOffset,
+                bytesRead);
+
+            return buffer;
         }
-
-        _logger.LogDebug(
-            "Read piece {PieceIndex} from {FilePath} at offset {Offset} ({Size} bytes)",
-            pieceIndex,
-            filePath,
-            fileOffset,
-            bytesRead);
-
-        return buffer;
+        finally
+        {
+            _fileAccessLock.Release();
+        }
     }
 
     /// <summary>
