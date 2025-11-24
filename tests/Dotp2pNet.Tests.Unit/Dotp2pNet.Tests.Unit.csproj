@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Dotp2pNet.Core\Dotp2pNet.Core.csproj" />
+    <ProjectReference Include="..\..\src\Dotp2pNet.Discovery\Dotp2pNet.Discovery.csproj" />
     <ProjectReference Include="..\..\src\Dotp2pNet.Orchestration\Dotp2pNet.Orchestration.csproj" />
     <ProjectReference Include="..\..\src\Dotp2pNet.Storage\Dotp2pNet.Storage.csproj" />
   </ItemGroup>
