@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Dotp2pNet.Core.Interfaces;
+using Dotp2pNet.Core.Metrics;
 using Dotp2pNet.Core.Models;
 using Microsoft.Extensions.Logging;
 
@@ -22,6 +23,7 @@ public class TorrentEngine : ITorrentEngine
     private readonly IPieceSelector _pieceSelector;
     private readonly IPeerSelector _peerSelector;
     private readonly ILogger<TorrentEngine> _logger;
+    private readonly MetricsCollector _metricsCollector;
 
     // Track active torrents by info hash
     private readonly ConcurrentDictionary<string, TorrentContext> _activeTorrents = new();
@@ -42,6 +44,7 @@ public class TorrentEngine : ITorrentEngine
         IPieceSelector pieceSelector,
         IPeerSelector peerSelector,
         ILogger<TorrentEngine> logger,
+        MetricsCollector? metricsCollector = null,
         int listenPort = 6881,
         int maxConnections = 50)
     {
@@ -52,6 +55,7 @@ public class TorrentEngine : ITorrentEngine
         _pieceSelector = pieceSelector ?? throw new ArgumentNullException(nameof(pieceSelector));
         _peerSelector = peerSelector ?? throw new ArgumentNullException(nameof(peerSelector));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _metricsCollector = metricsCollector ?? new MetricsCollector();
 
         _listenPort = listenPort;
         _maxConnections = maxConnections;
@@ -343,6 +347,9 @@ public class TorrentEngine : ITorrentEngine
 
         if (_activeTorrents.TryGetValue(infoHashKey, out var context))
         {
+            // Update metrics
+            UpdateStatusFromMetrics(context, infoHash);
+            
             // Update calculated fields
             context.Status.UpdateProgress();
             context.Status.UpdateEstimatedTime();
@@ -359,12 +366,24 @@ public class TorrentEngine : ITorrentEngine
 
         foreach (var context in _activeTorrents.Values)
         {
+            // Update metrics
+            UpdateStatusFromMetrics(context, context.Metadata.InfoHash);
+            
             context.Status.UpdateProgress();
             context.Status.UpdateEstimatedTime();
             statuses.Add(context.Status);
         }
 
         return statuses;
+    }
+
+    /// <summary>
+    /// Gets the metrics collector for accessing detailed metrics.
+    /// </summary>
+    /// <returns>The metrics collector instance.</returns>
+    public MetricsCollector GetMetricsCollector()
+    {
+        return _metricsCollector;
     }
 
     /// <summary>
@@ -644,15 +663,33 @@ public class TorrentEngine : ITorrentEngine
         context.Status.Remaining = context.Status.TotalSize - context.Status.Downloaded;
         context.Status.UpdateProgress();
 
-        // Calculate rates (simplified - would use sliding window in real implementation)
+        // Record download metrics
         var elapsed = DateTime.UtcNow - context.LastStatusUpdate;
         if (elapsed.TotalSeconds >= 1)
         {
             var bytesDownloaded = context.Status.Downloaded - context.LastDownloaded;
-            context.Status.DownloadRate = (long)(bytesDownloaded / elapsed.TotalSeconds);
+            if (bytesDownloaded > 0)
+            {
+                _metricsCollector.RecordDownload(context.Metadata.InfoHash, bytesDownloaded);
+            }
 
             context.LastDownloaded = context.Status.Downloaded;
             context.LastStatusUpdate = DateTime.UtcNow;
+        }
+
+        // Get download rate from metrics collector (uses sliding window)
+        context.Status.DownloadRate = _metricsCollector.GetDownloadRate();
+
+        // Record peer connections
+        _metricsCollector.RecordPeerConnections(
+            context.Metadata.InfoHash,
+            context.PeerConnections.Count,
+            context.AvailablePeers.Count);
+
+        // Record DHT routing table size
+        if (_dhtNode.IsRunning)
+        {
+            _metricsCollector.RecordDhtRoutingTableSize(_dhtNode.GetRoutingTableSize());
         }
 
         context.Status.UpdateEstimatedTime();
@@ -663,15 +700,33 @@ public class TorrentEngine : ITorrentEngine
     /// </summary>
     private void UpdateSeedingStatus(TorrentContext context)
     {
-        // Calculate upload rate (simplified)
+        // Record upload metrics
         var elapsed = DateTime.UtcNow - context.LastStatusUpdate;
         if (elapsed.TotalSeconds >= 1)
         {
             var bytesUploaded = context.Status.Uploaded - context.LastUploaded;
-            context.Status.UploadRate = (long)(bytesUploaded / elapsed.TotalSeconds);
+            if (bytesUploaded > 0)
+            {
+                _metricsCollector.RecordUpload(context.Metadata.InfoHash, bytesUploaded);
+            }
 
             context.LastUploaded = context.Status.Uploaded;
             context.LastStatusUpdate = DateTime.UtcNow;
+        }
+
+        // Get upload rate from metrics collector (uses sliding window)
+        context.Status.UploadRate = _metricsCollector.GetUploadRate();
+
+        // Record peer connections
+        _metricsCollector.RecordPeerConnections(
+            context.Metadata.InfoHash,
+            context.PeerConnections.Count,
+            context.AvailablePeers.Count);
+
+        // Record DHT routing table size
+        if (_dhtNode.IsRunning)
+        {
+            _metricsCollector.RecordDhtRoutingTableSize(_dhtNode.GetRoutingTableSize());
         }
     }
 
@@ -736,6 +791,60 @@ public class TorrentEngine : ITorrentEngine
         random.NextBytes(peerId.AsSpan(prefix.Length));
 
         return peerId;
+    }
+
+    /// <summary>
+    /// Updates torrent status from metrics collector.
+    /// </summary>
+    private void UpdateStatusFromMetrics(TorrentContext context, byte[] infoHash)
+    {
+        var metrics = _metricsCollector.GetTorrentMetrics(infoHash);
+        if (metrics != null)
+        {
+            // Update rates from metrics collector (uses sliding window calculation)
+            context.Status.DownloadRate = _metricsCollector.GetDownloadRate();
+            context.Status.UploadRate = _metricsCollector.GetUploadRate();
+        }
+    }
+
+    /// <summary>
+    /// Stores a piece and records metrics for hash verification and completion.
+    /// </summary>
+    /// <param name="context">The torrent context.</param>
+    /// <param name="pieceIndex">The index of the piece.</param>
+    /// <param name="data">The piece data.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>True if the piece was stored successfully; otherwise, false.</returns>
+    private async Task<bool> StorePieceWithMetricsAsync(
+        TorrentContext context,
+        int pieceIndex,
+        byte[] data,
+        CancellationToken ct)
+    {
+        var success = await _pieceManager.StorePieceAsync(pieceIndex, data, ct);
+
+        // Record hash verification result
+        _metricsCollector.RecordHashVerification(context.Metadata.InfoHash, success);
+
+        if (success)
+        {
+            // Record piece completion
+            _metricsCollector.RecordPieceCompleted(context.Metadata.InfoHash, pieceIndex);
+
+            _logger.LogInformation(
+                "Piece {PieceIndex} completed for torrent {Name} (hash verified)",
+                pieceIndex,
+                context.Metadata.Name);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "Piece {PieceIndex} failed hash verification for torrent {Name}",
+                pieceIndex,
+                context.Metadata.Name);
+        }
+
+        return success;
     }
 
     /// <summary>
