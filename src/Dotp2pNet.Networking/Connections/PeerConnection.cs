@@ -146,6 +146,11 @@ public class PeerConnection : IPeerConnection
         _logger.LogInformation(
             "PeerConnection created for {RemoteEndpoint}",
             _tcpClient.Client.RemoteEndPoint);
+        
+        _logger.LogDebug(
+            "Connection state: AmChoking={AmChoking}, PeerChoking={PeerChoking}, " +
+            "AmInterested={AmInterested}, PeerInterested={PeerInterested}",
+            _amChoking, _peerChoking, _amInterested, _peerInterested);
     }
 
     /// <summary>
@@ -312,8 +317,9 @@ public class PeerConnection : IPeerConnection
             _peerId = BitConverter.ToString(receivedPeerId[..8]).Replace("-", "").ToLower();
 
             _logger.LogInformation(
-                "Handshake successful with peer {PeerId}",
-                _peerId);
+                "Handshake successful with peer {PeerId} at {RemoteEndpoint}",
+                _peerId,
+                _tcpClient.Client.RemoteEndPoint);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

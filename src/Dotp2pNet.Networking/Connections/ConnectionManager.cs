@@ -169,6 +169,12 @@ public class ConnectionManager : IConnectionManager, IDisposable
                 connectionId,
                 _connections.Count,
                 _config.MaxConnections);
+            
+            _logger.LogDebug(
+                "Connection established: ConnectionId={ConnectionId}, PeerId={PeerId}, Endpoint={Endpoint}",
+                connectionId,
+                connection.PeerId,
+                $"{ipAddress}:{port}");
 
             return connection;
         }

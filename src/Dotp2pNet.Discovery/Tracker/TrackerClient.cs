@@ -81,9 +81,19 @@ public class TrackerClient : ITrackerClient
                 eventType);
 
             _logger.LogInformation(
-                "Announcing to tracker {TrackerUrl} with event {Event}",
+                "Announcing to tracker {TrackerUrl} with event {Event}, " +
+                "Downloaded={Downloaded}, Uploaded={Uploaded}, Left={Left}, Port={Port}",
                 trackerUrl,
-                eventType);
+                eventType,
+                downloaded,
+                uploaded,
+                left,
+                port);
+            
+            _logger.LogDebug(
+                "Tracker announce details: InfoHash={InfoHash}, PeerId={PeerId}",
+                Convert.ToHexString(infoHash[..4]),
+                Convert.ToHexString(peerId[..4]));
 
             // Send HTTP GET request to tracker
             var response = await _httpClient.GetAsync(announceUrl, ct);
@@ -107,6 +117,16 @@ public class TrackerClient : ITrackerClient
                 trackerResponse.Complete,
                 trackerResponse.Incomplete,
                 trackerResponse.Interval);
+            
+            _logger.LogDebug(
+                "Tracker response details: PeerCount={PeerCount}, Complete={Complete}, " +
+                "Incomplete={Incomplete}, Interval={Interval}, MinInterval={MinInterval}, TrackerId={TrackerId}",
+                trackerResponse.Peers.Count,
+                trackerResponse.Complete,
+                trackerResponse.Incomplete,
+                trackerResponse.Interval,
+                trackerResponse.MinInterval,
+                trackerResponse.TrackerId);
 
             return trackerResponse;
         }

@@ -75,7 +75,15 @@ public class DhtNode : IDhtNode
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _isRunning = true;
 
-        _logger.LogInformation("DHT node started on port {Port}", port);
+        _logger.LogInformation(
+            "DHT node started on port {Port}, NodeId={NodeId}",
+            port,
+            BitConverter.ToString(NodeId[..8]).Replace("-", "").ToLower());
+        
+        _logger.LogDebug(
+            "DHT node initialization: Port={Port}, IsRunning={IsRunning}",
+            port,
+            _isRunning);
 
         // Start receiving messages
         _receiveTask = Task.Run(() => ReceiveLoop(_cts.Token), _cts.Token);
@@ -122,7 +130,14 @@ public class DhtNode : IDhtNode
         if (!_isRunning)
             throw new InvalidOperationException("DHT node is not running");
 
-        _logger.LogInformation("Bootstrapping DHT with {Count} bootstrap nodes", bootstrapNodes.Count);
+        _logger.LogInformation(
+            "Bootstrapping DHT with {Count} bootstrap nodes",
+            bootstrapNodes.Count);
+        
+        _logger.LogDebug(
+            "DHT bootstrap details: BootstrapNodeCount={Count}, NodeId={NodeId}",
+            bootstrapNodes.Count,
+            BitConverter.ToString(NodeId[..4]).Replace("-", "").ToLower());
 
         // Add bootstrap nodes to routing table
         foreach (var peer in bootstrapNodes)
@@ -238,8 +253,23 @@ public class DhtNode : IDhtNode
                 .ToList();
         }
 
-        _logger.LogInformation("Found {Count} peers for info hash", peers.Count);
-        return peers.DistinctBy(p => p.Endpoint).ToList();
+        var distinctPeers = peers.DistinctBy(p => p.Endpoint).ToList();
+        
+        _logger.LogInformation(
+            "Found {Count} peers for info hash {InfoHash} (after deduplication: {DistinctCount})",
+            peers.Count,
+            Convert.ToHexString(infoHash[..4]),
+            distinctPeers.Count);
+        
+        _logger.LogDebug(
+            "DHT peer discovery details: InfoHash={InfoHash}, TotalPeers={TotalPeers}, " +
+            "DistinctPeers={DistinctPeers}, QueriedNodes={QueriedNodes}",
+            Convert.ToHexString(infoHash[..4]),
+            peers.Count,
+            distinctPeers.Count,
+            queriedNodes.Count);
+        
+        return distinctPeers;
     }
 
     /// <summary>

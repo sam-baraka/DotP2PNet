@@ -234,11 +234,24 @@ public class PieceManager : IPieceManager
             // Add to cache
             _pieceCache.TryAdd(pieceIndex, data);
 
+            var progress = (CompletedPieces * 100.0) / TotalPieces;
+            
             _logger.LogInformation(
-                "Successfully stored piece {PieceIndex}/{TotalPieces} ({Progress:F2}%)",
+                "Successfully stored and verified piece {PieceIndex}/{TotalPieces} ({Progress:F2}%), " +
+                "Size={PieceSize} bytes, Hash={PieceHash}",
                 pieceIndex,
                 TotalPieces,
-                (CompletedPieces * 100.0) / TotalPieces);
+                progress,
+                data.Length,
+                Convert.ToHexString(_metadata.PieceHashes[pieceIndex][..4]));
+            
+            _logger.LogDebug(
+                "Piece storage details: PieceIndex={PieceIndex}, CompletedPieces={CompletedPieces}, " +
+                "TotalPieces={TotalPieces}, Progress={Progress:F2}%",
+                pieceIndex,
+                CompletedPieces,
+                TotalPieces,
+                progress);
 
             return true;
         }
