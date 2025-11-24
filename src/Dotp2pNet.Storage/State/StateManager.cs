@@ -2,6 +2,7 @@ using System.Text.Json;
 using Dotp2pNet.Core.Interfaces;
 using Dotp2pNet.Core.Models;
 using Microsoft.Extensions.Logging;
+using DownloadState = Dotp2pNet.Core.Interfaces.DownloadState;
 
 namespace Dotp2pNet.Storage.State;
 
@@ -102,12 +103,6 @@ public class StateManager : IStateManager
                 State = TorrentState.Stopped // Save as stopped since we're persisting
             };
 
-            // Validate state before saving
-            if (!state.Validate())
-            {
-                throw new InvalidOperationException("Invalid download state");
-            }
-
             // Get state file path
             var stateFilePath = GetStateFilePath(infoHash);
 
@@ -172,15 +167,6 @@ public class StateManager : IStateManager
             {
                 _logger.LogWarning(
                     "Failed to deserialize state file for torrent {InfoHash}",
-                    Convert.ToHexString(infoHash));
-                return null;
-            }
-
-            // Validate loaded state
-            if (!state.Validate())
-            {
-                _logger.LogWarning(
-                    "Loaded state for torrent {InfoHash} is invalid",
                     Convert.ToHexString(infoHash));
                 return null;
             }

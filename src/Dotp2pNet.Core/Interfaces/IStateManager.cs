@@ -1,4 +1,22 @@
+using Dotp2pNet.Core.Models;
+
 namespace Dotp2pNet.Core.Interfaces;
+
+/// <summary>
+/// Represents the persisted state of a torrent download.
+/// </summary>
+public class DownloadState
+{
+    public TorrentMetadata Metadata { get; set; } = new();
+    public byte[] BitfieldBytes { get; set; } = Array.Empty<byte>();
+    public int PieceCount { get; set; }
+    public string DownloadDirectory { get; set; } = string.Empty;
+    public long BytesDownloaded { get; set; }
+    public long BytesUploaded { get; set; }
+    public DateTime LastActive { get; set; } = DateTime.UtcNow;
+    public DateTime AddedAt { get; set; } = DateTime.UtcNow;
+    public TorrentState State { get; set; } = TorrentState.Stopped;
+}
 
 /// <summary>
 /// Manages persistence of download state to disk.
@@ -23,7 +41,7 @@ public interface IStateManager
     /// <returns>A task representing the asynchronous operation.</returns>
     Task SaveStateAsync(
         byte[] infoHash,
-        Core.Models.TorrentMetadata metadata,
+        TorrentMetadata metadata,
         IBitfield bitfield,
         string downloadDirectory,
         long bytesDownloaded,
@@ -39,7 +57,7 @@ public interface IStateManager
     /// A task representing the asynchronous operation. The task result contains
     /// the loaded download state, or null if no state file exists.
     /// </returns>
-    Task<Storage.State.DownloadState?> LoadStateAsync(
+    Task<DownloadState?> LoadStateAsync(
         byte[] infoHash,
         CancellationToken ct = default);
 
