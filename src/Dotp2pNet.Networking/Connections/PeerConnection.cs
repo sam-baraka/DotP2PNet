@@ -1,6 +1,7 @@
 using System.Net.Sockets;
 using System.Threading.Channels;
 using Dotp2pNet.Core.Interfaces;
+using Dotp2pNet.Core.ErrorHandling;
 using Microsoft.Extensions.Logging;
 
 namespace Dotp2pNet.Networking.Connections;
@@ -42,6 +43,7 @@ public class PeerConnection : IPeerConnection
     private readonly Channel<(byte messageType, byte[] payload)> _incomingMessages;
     private readonly CancellationTokenSource _disposalCts;
     private readonly Task _receiveTask;
+    private readonly TimeoutTracker _inactivityTracker;
 
     private volatile bool _isConnected;
     private volatile bool _amChoking;
@@ -83,6 +85,18 @@ public class PeerConnection : IPeerConnection
     public bool PeerInterested => _peerInterested;
 
     /// <summary>
+    /// Checks if the peer has been inactive for too long (2 minutes).
+    /// </summary>
+    /// <returns>True if the peer has timed out, false otherwise.</returns>
+    public bool HasTimedOut() => _inactivityTracker.HasTimedOut();
+
+    /// <summary>
+    /// Gets the time since the last activity from this peer.
+    /// </summary>
+    /// <returns>Time elapsed since last activity.</returns>
+    public TimeSpan GetTimeSinceLastActivity() => _inactivityTracker.GetTimeSinceLastActivity();
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="PeerConnection"/> class with an existing TCP client.
     /// </summary>
     /// <param name="tcpClient">The connected TCP client.</param>
@@ -115,6 +129,9 @@ public class PeerConnection : IPeerConnection
             SingleWriter = true
         });
         _disposalCts = new CancellationTokenSource();
+        
+        // Initialize inactivity tracker with 2-minute timeout
+        _inactivityTracker = new TimeoutTracker(TimeSpan.FromMinutes(2));
 
         _peerId = "unknown";
         _isConnected = true;
@@ -433,6 +450,9 @@ public class PeerConnection : IPeerConnection
                 // Write parsed messages to channel
                 foreach (var (messageType, payload) in messages)
                 {
+                    // Record activity when message received
+                    _inactivityTracker.RecordActivity();
+                    
                     await _incomingMessages.Writer.WriteAsync((messageType, payload), ct)
                         .ConfigureAwait(false);
 
@@ -441,6 +461,16 @@ public class PeerConnection : IPeerConnection
                         messageType,
                         payload.Length,
                         _peerId);
+                }
+                
+                // Check for timeout after processing messages
+                if (_inactivityTracker.HasTimedOut())
+                {
+                    _logger.LogWarning(
+                        "Peer {PeerId} has been inactive for {Elapsed}, closing connection",
+                        _peerId,
+                        _inactivityTracker.GetTimeSinceLastActivity());
+                    break;
                 }
             }
         }
