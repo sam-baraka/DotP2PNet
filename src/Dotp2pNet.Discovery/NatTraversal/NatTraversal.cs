@@ -1,5 +1,8 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using Dotp2pNet.Core.Interfaces;
 using Dotp2pNet.Core.Models;
 using Microsoft.Extensions.Logging;
@@ -66,10 +69,72 @@ public class NatTraversal : INatTraversal
         return null;
     }
 
-    public Task<bool> TryUpnpPortMappingAsync(int internalPort, int externalPort, CancellationToken ct = default)
+    public async Task<bool> TryUpnpPortMappingAsync(int internalPort, int externalPort, CancellationToken ct = default)
     {
-        _logger.LogInformation("UPnP port mapping not yet implemented (Task 19)");
-        return Task.FromResult(false);
+        _logger.LogInformation("Attempting UPnP port mapping: {InternalPort} -> {ExternalPort}", 
+            internalPort, externalPort);
+
+        try
+        {
+            // Step 1: Discover UPnP-enabled router using SSDP
+            var gatewayUrl = await DiscoverUpnpGatewayAsync(ct).ConfigureAwait(false);
+            
+            if (gatewayUrl == null)
+            {
+                _logger.LogWarning("No UPnP-enabled router discovered");
+                return false;
+            }
+
+            _logger.LogInformation("Discovered UPnP gateway at {Url}", gatewayUrl);
+
+            // Step 2: Get the control URL from device description
+            var controlUrl = await GetControlUrlAsync(gatewayUrl, ct).ConfigureAwait(false);
+            
+            if (controlUrl == null)
+            {
+                _logger.LogWarning("Failed to get UPnP control URL from gateway");
+                return false;
+            }
+
+            _logger.LogDebug("UPnP control URL: {ControlUrl}", controlUrl);
+
+            // Step 3: Get local IP address
+            var localIp = GetLocalIpAddress();
+            
+            if (localIp == null)
+            {
+                _logger.LogWarning("Failed to determine local IP address");
+                return false;
+            }
+
+            _logger.LogDebug("Local IP address: {LocalIp}", localIp);
+
+            // Step 4: Add port mapping
+            var success = await AddPortMappingAsync(
+                controlUrl, 
+                externalPort, 
+                internalPort, 
+                localIp, 
+                ct).ConfigureAwait(false);
+
+            if (success)
+            {
+                _logger.LogInformation(
+                    "Successfully created UPnP port mapping: {ExternalPort} -> {LocalIp}:{InternalPort}",
+                    externalPort, localIp, internalPort);
+            }
+            else
+            {
+                _logger.LogWarning("Failed to create UPnP port mapping");
+            }
+
+            return success;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error during UPnP port mapping");
+            return false;
+        }
     }
 
     public Task<bool> TryUdpHolePunchingAsync(PeerInfo remotePeer, CancellationToken ct = default)
@@ -302,4 +367,286 @@ public class NatTraversal : INatTraversal
             return null;
         }
     }
+
+    #region UPnP Implementation
+
+    private const string SsdpMulticastAddress = "239.255.255.250";
+    private const int SsdpPort = 1900;
+    private const string SsdpSearchTarget = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
+    private const string UpnpServiceType = "urn:schemas-upnp-org:service:WANIPConnection:1";
+
+    /// <summary>
+    /// Discovers UPnP-enabled gateway using SSDP (Simple Service Discovery Protocol).
+    /// </summary>
+    private async Task<string?> DiscoverUpnpGatewayAsync(CancellationToken ct)
+    {
+        _logger.LogDebug("Starting SSDP discovery for UPnP gateway");
+
+        try
+        {
+            using var udpClient = new UdpClient();
+            udpClient.Client.ReceiveTimeout = 3000;
+            udpClient.Client.SendTimeout = 3000;
+
+            // SSDP M-SEARCH request
+            var searchMessage = 
+                "M-SEARCH * HTTP/1.1\r\n" +
+                $"HOST: {SsdpMulticastAddress}:{SsdpPort}\r\n" +
+                "MAN: \"ssdp:discover\"\r\n" +
+                "MX: 2\r\n" +
+                $"ST: {SsdpSearchTarget}\r\n" +
+                "\r\n";
+
+            var searchBytes = Encoding.ASCII.GetBytes(searchMessage);
+            var multicastEndpoint = new IPEndPoint(IPAddress.Parse(SsdpMulticastAddress), SsdpPort);
+
+            _logger.LogDebug("Sending SSDP M-SEARCH to {Endpoint}", multicastEndpoint);
+            await udpClient.SendAsync(searchBytes, searchBytes.Length, multicastEndpoint).ConfigureAwait(false);
+
+            // Wait for response
+            var receiveTask = udpClient.ReceiveAsync();
+            var timeoutTask = Task.Delay(3000, ct);
+            var completedTask = await Task.WhenAny(receiveTask, timeoutTask).ConfigureAwait(false);
+
+            if (completedTask == timeoutTask)
+            {
+                _logger.LogDebug("SSDP discovery timed out");
+                return null;
+            }
+
+            var result = await receiveTask.ConfigureAwait(false);
+            var response = Encoding.ASCII.GetString(result.Buffer);
+
+            _logger.LogDebug("Received SSDP response from {Endpoint}", result.RemoteEndPoint);
+
+            // Extract LOCATION header
+            var locationMatch = Regex.Match(response, @"LOCATION:\s*(.+)", RegexOptions.IgnoreCase);
+            if (locationMatch.Success)
+            {
+                var location = locationMatch.Groups[1].Value.Trim();
+                _logger.LogDebug("Found device location: {Location}", location);
+                return location;
+            }
+
+            _logger.LogWarning("No LOCATION header found in SSDP response");
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Error during SSDP discovery");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Retrieves the control URL from the UPnP device description.
+    /// </summary>
+    private async Task<string?> GetControlUrlAsync(string deviceUrl, CancellationToken ct)
+    {
+        _logger.LogDebug("Fetching UPnP device description from {Url}", deviceUrl);
+
+        try
+        {
+            using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var response = await httpClient.GetStringAsync(deviceUrl, ct).ConfigureAwait(false);
+
+            _logger.LogDebug("Parsing device description XML");
+
+            // Parse XML to find WANIPConnection service
+            var doc = XDocument.Parse(response);
+            var ns = doc.Root?.GetDefaultNamespace() ?? XNamespace.None;
+
+            // Find the WANIPConnection service
+            var service = doc.Descendants(ns + "service")
+                .FirstOrDefault(s => 
+                    s.Element(ns + "serviceType")?.Value == UpnpServiceType);
+
+            if (service == null)
+            {
+                _logger.LogWarning("WANIPConnection service not found in device description");
+                return null;
+            }
+
+            var controlUrl = service.Element(ns + "controlURL")?.Value;
+            
+            if (string.IsNullOrEmpty(controlUrl))
+            {
+                _logger.LogWarning("Control URL not found in service description");
+                return null;
+            }
+
+            // Make control URL absolute if it's relative
+            if (!controlUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            {
+                var baseUri = new Uri(deviceUrl);
+                var baseUrl = $"{baseUri.Scheme}://{baseUri.Host}:{baseUri.Port}";
+                
+                if (!controlUrl.StartsWith("/"))
+                    controlUrl = "/" + controlUrl;
+                    
+                controlUrl = baseUrl + controlUrl;
+            }
+
+            return controlUrl;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Error getting control URL from device description");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Gets the local IP address used for outbound connections.
+    /// </summary>
+    private string? GetLocalIpAddress()
+    {
+        try
+        {
+            // Connect to a public IP to determine which local interface is used
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect("8.8.8.8", 80);
+            
+            var localEndPoint = socket.LocalEndPoint as IPEndPoint;
+            return localEndPoint?.Address.ToString();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error determining local IP address");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Adds a port mapping via UPnP SOAP request.
+    /// </summary>
+    private async Task<bool> AddPortMappingAsync(
+        string controlUrl, 
+        int externalPort, 
+        int internalPort, 
+        string internalClient, 
+        CancellationToken ct)
+    {
+        _logger.LogDebug(
+            "Sending AddPortMapping request: external={ExternalPort}, internal={InternalClient}:{InternalPort}",
+            externalPort, internalClient, internalPort);
+
+        try
+        {
+            // SOAP request for AddPortMapping
+            var soapAction = "urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping";
+            var soapBody = 
+                "<?xml version=\"1.0\"?>" +
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+                "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+                "<s:Body>" +
+                "<u:AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">" +
+                "<NewRemoteHost></NewRemoteHost>" +
+                $"<NewExternalPort>{externalPort}</NewExternalPort>" +
+                "<NewProtocol>TCP</NewProtocol>" +
+                $"<NewInternalPort>{internalPort}</NewInternalPort>" +
+                $"<NewInternalClient>{internalClient}</NewInternalClient>" +
+                "<NewEnabled>1</NewEnabled>" +
+                "<NewPortMappingDescription>Dotp2pNet P2P</NewPortMappingDescription>" +
+                "<NewLeaseDuration>0</NewLeaseDuration>" +
+                "</u:AddPortMapping>" +
+                "</s:Body>" +
+                "</s:Envelope>";
+
+            using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var content = new StringContent(soapBody, Encoding.UTF8, "text/xml");
+            content.Headers.Add("SOAPAction", $"\"{soapAction}\"");
+
+            var response = await httpClient.PostAsync(controlUrl, content, ct).ConfigureAwait(false);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("UPnP port mapping added successfully");
+                return true;
+            }
+
+            var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            _logger.LogWarning(
+                "UPnP AddPortMapping failed with status {StatusCode}: {Response}",
+                response.StatusCode, responseBody);
+            
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Error sending AddPortMapping request");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes a port mapping via UPnP SOAP request.
+    /// Should be called on application shutdown to clean up port mappings.
+    /// </summary>
+    public async Task<bool> DeletePortMappingAsync(int externalPort, CancellationToken ct = default)
+    {
+        _logger.LogInformation("Attempting to delete UPnP port mapping for port {ExternalPort}", externalPort);
+
+        try
+        {
+            // Step 1: Discover UPnP-enabled router
+            var gatewayUrl = await DiscoverUpnpGatewayAsync(ct).ConfigureAwait(false);
+            
+            if (gatewayUrl == null)
+            {
+                _logger.LogWarning("No UPnP-enabled router discovered for cleanup");
+                return false;
+            }
+
+            // Step 2: Get the control URL
+            var controlUrl = await GetControlUrlAsync(gatewayUrl, ct).ConfigureAwait(false);
+            
+            if (controlUrl == null)
+            {
+                _logger.LogWarning("Failed to get UPnP control URL for cleanup");
+                return false;
+            }
+
+            // Step 3: Delete port mapping
+            var soapAction = "urn:schemas-upnp-org:service:WANIPConnection:1#DeletePortMapping";
+            var soapBody = 
+                "<?xml version=\"1.0\"?>" +
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+                "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+                "<s:Body>" +
+                "<u:DeletePortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">" +
+                "<NewRemoteHost></NewRemoteHost>" +
+                $"<NewExternalPort>{externalPort}</NewExternalPort>" +
+                "<NewProtocol>TCP</NewProtocol>" +
+                "</u:DeletePortMapping>" +
+                "</s:Body>" +
+                "</s:Envelope>";
+
+            using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var content = new StringContent(soapBody, Encoding.UTF8, "text/xml");
+            content.Headers.Add("SOAPAction", $"\"{soapAction}\"");
+
+            var response = await httpClient.PostAsync(controlUrl, content, ct).ConfigureAwait(false);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("UPnP port mapping deleted successfully for port {ExternalPort}", externalPort);
+                return true;
+            }
+
+            var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            _logger.LogWarning(
+                "UPnP DeletePortMapping failed with status {StatusCode}: {Response}",
+                response.StatusCode, responseBody);
+            
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error deleting UPnP port mapping");
+            return false;
+        }
+    }
+
+    #endregion
 }

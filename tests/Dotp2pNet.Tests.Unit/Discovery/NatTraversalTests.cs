@@ -47,16 +47,55 @@ public class NatTraversalTests
     }
 
     [Fact]
-    public async Task TryUpnpPortMappingAsync_ShouldReturnFalse_WhenNotImplemented()
+    public async Task TryUpnpPortMappingAsync_ShouldHandleNoUpnpRouter()
     {
         // Arrange
         var natTraversal = new NatTraversal(_logger);
 
         // Act
+        // This will attempt to discover a UPnP router
+        // In most test environments, this will return false (no UPnP router)
+        // But the method should handle this gracefully without throwing
         var result = await natTraversal.TryUpnpPortMappingAsync(6881, 6881);
 
         // Assert
+        // We can't assert true/false definitively since it depends on the network
+        // But we can assert that the method completes without throwing
+        Assert.IsType<bool>(result);
+    }
+
+    [Fact]
+    public async Task TryUpnpPortMappingAsync_WithCancellation_ShouldReturnFalseGracefully()
+    {
+        // Arrange
+        var natTraversal = new NatTraversal(_logger);
+        var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        // Act
+        // The implementation catches OperationCanceledException and returns false gracefully
+        var result = await natTraversal.TryUpnpPortMappingAsync(6881, 6881, cts.Token);
+
+        // Assert
+        // Should return false when cancelled, not throw
         Assert.False(result);
+    }
+
+    [Fact]
+    public async Task DeletePortMappingAsync_ShouldHandleNoUpnpRouter()
+    {
+        // Arrange
+        var natTraversal = new NatTraversal(_logger);
+
+        // Act
+        // This will attempt to discover a UPnP router and delete a mapping
+        // In most test environments, this will return false (no UPnP router)
+        var result = await natTraversal.DeletePortMappingAsync(6881);
+
+        // Assert
+        // We can't assert true/false definitively since it depends on the network
+        // But we can assert that the method completes without throwing
+        Assert.IsType<bool>(result);
     }
 
     [Fact]

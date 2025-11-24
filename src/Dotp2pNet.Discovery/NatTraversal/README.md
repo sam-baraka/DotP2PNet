@@ -173,11 +173,60 @@ Peer A <---> Relay Server <---> Peer B
 - Test with multiple STUN servers
 - Handle failures gracefully
 
-### Phase 2: UPnP (Task 19)
-- Implement SSDP discovery
-- Send UPnP AddPortMapping requests
-- Handle routers without UPnP
-- Clean up mappings on shutdown
+### Phase 2: UPnP (Task 19) ✅ Completed
+- ✅ Implement SSDP discovery
+- ✅ Send UPnP AddPortMapping requests
+- ✅ Handle routers without UPnP
+- ✅ Clean up mappings on shutdown
+
+**Implementation Details**:
+
+The UPnP implementation follows a multi-step process:
+
+1. **SSDP Discovery**: Multicast M-SEARCH to 239.255.255.250:1900
+   ```
+   M-SEARCH * HTTP/1.1
+   HOST: 239.255.255.250:1900
+   MAN: "ssdp:discover"
+   MX: 2
+   ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+   ```
+
+2. **Device Description**: Parse XML from LOCATION header
+   - Extract WANIPConnection service control URL
+   - Handle both absolute and relative URLs
+
+3. **Port Mapping**: SOAP AddPortMapping request
+   ```xml
+   <u:AddPortMapping xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+     <NewExternalPort>6881</NewExternalPort>
+     <NewProtocol>TCP</NewProtocol>
+     <NewInternalPort>6881</NewInternalPort>
+     <NewInternalClient>192.168.1.100</NewInternalClient>
+     <NewEnabled>1</NewEnabled>
+     <NewPortMappingDescription>Dotp2pNet P2P</NewPortMappingDescription>
+     <NewLeaseDuration>0</NewLeaseDuration>
+   </u:AddPortMapping>
+   ```
+
+4. **Cleanup**: DeletePortMapping on shutdown
+   - Removes forwarding rule from router
+   - Prevents port conflicts on restart
+
+**Usage**:
+```csharp
+var natTraversal = new NatTraversal(logger);
+
+// Add port mapping
+var success = await natTraversal.TryUpnpPortMappingAsync(6881, 6881);
+if (success)
+{
+    Console.WriteLine("Port forwarding configured automatically");
+}
+
+// Clean up on shutdown
+await natTraversal.DeletePortMappingAsync(6881);
+```
 
 ### Phase 3: UDP Hole Punching (Task 20)
 - Coordinate with remote peer
