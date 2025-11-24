@@ -1,191 +1,221 @@
 # Piece Selection Strategies
 
-This directory contains implementations of different piece selection strategies for the P2P file transfer system.
+This directory contains implementations of different piece selection strategies for optimizing P2P file downloads.
 
 ## Overview
 
 Piece selection is a critical component of BitTorrent-like protocols. The strategy used to select which piece to download next significantly impacts:
 - Download speed
-- Swarm health (availability of pieces across peers)
-- Trading opportunities with other peers
+- Swarm health (availability of rare pieces)
 - Time to first complete piece
+- Overall completion time
 
-## Strategies Implemented
+## Strategies
 
-### 1. Random-First (`RandomFirstPieceSelector`)
+### 1. RandomFirstPieceSelector
 
-**When to use:** Initial download phase (0-5% complete)
+**When to use:** Early download phase (0-5% complete)
 
 **How it works:**
-- Selects a random piece from all available pieces
+- Randomly selects from available pieces that peers have
 - No preference for rare or common pieces
 
 **Advantages:**
 - Simple and fast
 - Gets something complete quickly
-- Good for initial startup
+- Avoids the "last piece problem" early on
+- Good for testing and debugging
 
-**Disadvantages:**
+**Trade-offs:**
 - Doesn't optimize for swarm health
-- May select common pieces
+- May select common pieces that many peers already have
 
-**Use case:** Getting started quickly and avoiding the "last piece problem" where many peers need the same initial piece.
+**Example:**
+```csharp
+var selector = new RandomFirstPieceSelector();
+var nextPiece = selector.SelectNextPiece(localBitfield, peerBitfields);
+```
 
-### 2. Rarest-First (`RarestFirstPieceSelector`)
+### 2. RarestFirstPieceSelector
 
-**When to use:** Main download phase (5-95% complete)
+**When to use:** Middle download phase (5-95% complete)
 
 **How it works:**
-1. Count how many peers have each piece
-2. Select the piece that the fewest peers have
-3. If multiple pieces are equally rare, pick randomly
+1. Counts how many peers have each piece
+2. Selects the piece that the fewest peers have
+3. If multiple pieces are equally rare, picks randomly among them
 
 **Advantages:**
-- Optimal for swarm health
-- Distributes rare pieces across the network
-- Maximizes trading opportunities
-- Prevents pieces from becoming unavailable
+- Optimal for swarm health and long-term availability
+- Prevents pieces from becoming unavailable if seeders leave
+- Maximizes the value of each piece (can trade with more peers)
+- Increases trading opportunities with other peers
 
-**Disadvantages:**
-- Slightly more complex than random
-- Not optimal for the first few pieces
+**Trade-offs:**
+- Slightly more complex than random selection
+- May not be optimal for the first few pieces
 
-**Use case:** Standard BitTorrent strategy for the bulk of the download. This is the most important strategy for maintaining a healthy swarm.
+**Example:**
+```csharp
+var selector = new RarestFirstPieceSelector();
+var nextPiece = selector.SelectNextPiece(localBitfield, peerBitfields);
+```
 
-### 3. Endgame (`EndgamePieceSelector`)
+**Why rarest-first?**
 
-**When to use:** Final download phase (95-100% complete)
+This is the standard BitTorrent strategy because:
+- It distributes rare pieces throughout the swarm
+- It prevents pieces from becoming extinct if seeders leave
+- It maximizes the utility of each downloaded piece (you can trade it with more peers)
+- It improves overall swarm health
+
+### 3. EndgamePieceSelector
+
+**When to use:** Final download phase (95%+ complete)
 
 **How it works:**
-1. Request ALL remaining pieces from ALL peers that have them
-2. When a piece arrives, cancel pending requests for that piece
-3. Accept pieces from whichever peer responds first
+1. Requests ALL remaining pieces from ALL peers that have them
+2. When a piece arrives, cancel pending requests for that piece from other peers
+3. Tracks which pieces have been requested to prioritize unrequested ones
 
 **Advantages:**
 - Minimizes time to completion
-- Prevents slow peers from bottlenecking
-- Maximizes download speed in final phase
+- Prevents slow peers from bottlenecking the final pieces
+- Acceptable overhead when so few pieces remain
 
-**Disadvantages:**
+**Trade-offs:**
 - Wastes bandwidth on duplicate requests
 - Increases network overhead
 - Should only be used when nearly complete
 
-**Use case:** Finishing the download as quickly as possible when only a few pieces remain.
-
-## Strategy Selection
-
-The `PieceSelectorFactory` automatically chooses the appropriate strategy based on download progress:
-
-```
-0%                    5%                                95%                  100%
-├─────────────────────┼─────────────────────────────────┼─────────────────────┤
-│   Random-First      │        Rarest-First             │      Endgame        │
-└─────────────────────┴─────────────────────────────────┴─────────────────────┘
-```
-
-## Usage Example
-
+**Example:**
 ```csharp
-// Create the factory
+var selector = new EndgamePieceSelector();
+
+// Check if we should activate endgame mode
+if (EndgamePieceSelector.ShouldActivateEndgame(localBitfield, threshold: 0.95))
+{
+    var nextPiece = selector.SelectNextPiece(localBitfield, peerBitfields);
+    
+    if (nextPiece.HasValue)
+    {
+        selector.MarkPieceRequested(nextPiece.Value);
+        // Request the piece...
+    }
+}
+
+// When a piece is received
+selector.MarkPieceReceived(pieceIndex);
+```
+
+**Why endgame mode?**
+
+The last few pieces can take a long time if we wait for specific peers:
+- Some peers may be slow or unreliable
+- Waiting for a single peer to deliver the last piece is inefficient
+- By requesting from multiple peers, we get pieces as fast as possible
+- The bandwidth overhead is acceptable when so few pieces remain
+
+## PieceSelectorFactory
+
+The factory automatically selects the appropriate strategy based on download progress.
+
+**Strategy Transitions:**
+```
+0% ──────► 5% ──────► 95% ──────► 100%
+   Random      Rarest-First    Endgame
+```
+
+**Example:**
+```csharp
 var factory = new PieceSelectorFactory();
 
-// Get the appropriate selector based on progress
-var selector = factory.GetSelector(localBitfield);
+// Automatically selects the right strategy
+var nextPiece = factory.SelectNextPiece(localBitfield, peerBitfields);
 
-// Select the next piece
-int? pieceIndex = selector.SelectNextPiece(localBitfield, peerBitfields);
-
-if (pieceIndex.HasValue)
-{
-    // Request the piece from a peer
-    await RequestPieceAsync(pieceIndex.Value);
-}
-```
-
-## Advanced Usage
-
-### Endgame Mode Tracking
-
-The endgame selector tracks which pieces have been requested to avoid excessive duplication:
-
-```csharp
-var endgameSelector = factory.GetEndgameSelector();
-
-// Mark a piece as requested
-endgameSelector.MarkPieceRequested(pieceIndex);
-
-// When piece is received
-endgameSelector.MarkPieceReceived(pieceIndex);
-```
-
-### Progress Information
-
-Get detailed progress information:
-
-```csharp
+// Get current strategy info
 var (progress, strategy, complete, total) = factory.GetProgressInfo(localBitfield);
 Console.WriteLine($"Progress: {progress:P2} using {strategy} strategy");
-Console.WriteLine($"Pieces: {complete}/{total}");
+
+// Get the current strategy name
+var strategyName = factory.GetCurrentStrategyName(localBitfield);
 ```
 
 ## Design Decisions
 
-### Why Three Strategies?
+### Interface-Based Design
 
-1. **Random-First**: Solves the "cold start" problem where many peers need the same first piece
-2. **Rarest-First**: Proven optimal strategy for swarm health (BitTorrent standard)
-3. **Endgame**: Solves the "last piece" problem where slow peers delay completion
+All selectors implement `IPieceSelector`:
+```csharp
+public interface IPieceSelector
+{
+    int? SelectNextPiece(IBitfield localBitfield, Dictionary<Guid, IBitfield> peerBitfields);
+}
+```
 
-### Threshold Values
+This enables:
+- Polymorphism and strategy pattern
+- Easy testing with different strategies
+- Runtime strategy switching
 
-- **Random → Rarest transition (5%)**: Early enough to benefit from rarest-first, late enough to have some pieces to trade
-- **Rarest → Endgame transition (95%)**: Late enough that bandwidth waste is acceptable, early enough to speed up completion
+### Deterministic Testing
 
-These thresholds can be adjusted based on:
-- Network conditions
-- Number of peers
-- Piece size
-- Total file size
+All selectors support seeded random number generators:
+```csharp
+var selector = new RandomFirstPieceSelector(seed: 12345);
+```
+
+This enables:
+- Reproducible test results
+- Debugging of specific scenarios
+- Verification of algorithm correctness
+
+### Thread Safety
+
+The selectors themselves are stateless (except EndgamePieceSelector's tracking):
+- Safe to call from multiple threads
+- No internal locking required
+- Caller is responsible for synchronizing bitfield access
 
 ## Performance Considerations
 
-### Time Complexity
+### RandomFirstPieceSelector
+- **Time Complexity:** O(n) where n is the number of pieces
+- **Space Complexity:** O(n) for the available pieces list
+- **Optimization:** Could use reservoir sampling for very large torrents
 
-- **Random-First**: O(n) where n = number of pieces
-- **Rarest-First**: O(n × p) where n = pieces, p = peers
-- **Endgame**: O(n × p) where n = pieces, p = peers
+### RarestFirstPieceSelector
+- **Time Complexity:** O(n × p) where n is pieces and p is peers
+- **Space Complexity:** O(n) for the piece counts dictionary
+- **Optimization:** Could maintain sorted data structure for large swarms
 
-### Memory Usage
-
-All strategies use minimal memory:
-- Random: O(n) for available pieces list
-- Rarest: O(n) for piece counts
-- Endgame: O(n) for requested pieces tracking
-
-### Optimization Opportunities
-
-1. **Caching**: Cache piece counts in rarest-first to avoid recalculating
-2. **Incremental Updates**: Update counts incrementally when peer bitfields change
-3. **Parallel Processing**: Count pieces in parallel for large torrents
+### EndgamePieceSelector
+- **Time Complexity:** O(n) where n is the number of pieces
+- **Space Complexity:** O(r) where r is requested pieces (typically small)
+- **Optimization:** HashSet provides O(1) lookup for requested pieces
 
 ## Testing
 
-Each strategy includes:
-- Unit tests for selection logic
-- Edge case tests (no peers, no pieces, all pieces)
-- Integration tests with real bitfields
+Comprehensive unit tests cover:
+- Edge cases (no peers, all pieces owned, empty bitfields)
+- Correct piece selection logic for each strategy
+- Proper strategy transitions in factory
+- Deterministic behavior with seeded random
+
+Run tests:
+```bash
+dotnet test tests/Dotp2pNet.Tests.Unit/Dotp2pNet.Tests.Unit.csproj
+```
 
 ## Further Reading
 
 - [BitTorrent Protocol Specification (BEP 3)](http://www.bittorrent.org/beps/bep_0003.html)
-- [BitTorrent Economics Paper](https://www.bittorrent.org/bittorrentecon.pdf)
-- "Incentives Build Robustness in BitTorrent" by Bram Cohen
+- [Incentives Build Robustness in BitTorrent](https://www.bittorrent.org/bittorrentecon.pdf)
+- [Analysis of BitTorrent's Two Kademlia-Based DHTs](https://www.cs.helsinki.fi/u/lxwang/publications/P2P2012_13.pdf)
 
-## Future Enhancements
+## Related Components
 
-Potential improvements:
-- **Sequential mode**: For streaming video
-- **Priority-based selection**: User-specified piece priorities
-- **Adaptive thresholds**: Adjust based on swarm conditions
-- **Piece availability prediction**: ML-based prediction of piece availability
+- `IBitfield` - Tracks which pieces are available
+- `IPeerConnection` - Manages connections to peers
+- `PieceManager` - Handles piece storage and verification
+- `TorrentEngine` - Orchestrates the overall download process
