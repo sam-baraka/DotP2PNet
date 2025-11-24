@@ -59,7 +59,12 @@ public class NatTraversal : INatTraversal
                     return externalIp;
                 }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
+            {
+                _logger.LogDebug("STUN query cancelled");
+                return null;
+            }
+            catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to query STUN server {Server}", serverAddress);
             }
@@ -137,10 +142,299 @@ public class NatTraversal : INatTraversal
         }
     }
 
-    public Task<bool> TryUdpHolePunchingAsync(PeerInfo remotePeer, CancellationToken ct = default)
+    public async Task<bool> TryUdpHolePunchingAsync(PeerInfo remotePeer, CancellationToken ct = default)
     {
-        _logger.LogInformation("UDP hole punching not yet implemented (Task 20)");
-        return Task.FromResult(false);
+        _logger.LogInformation(
+            "Attempting UDP hole punching to peer {Peer}",
+            remotePeer.Endpoint);
+
+        try
+        {
+            // Validate peer information
+            if (!remotePeer.Validate())
+            {
+                _logger.LogWarning("Invalid peer information for hole punching");
+                return false;
+            }
+
+            // Step 1: Get our external IP address
+            var externalIp = await GetExternalIpAsync(ct).ConfigureAwait(false);
+            
+            if (externalIp == null)
+            {
+                _logger.LogWarning("Cannot perform hole punching without knowing external IP");
+                return false;
+            }
+
+            _logger.LogDebug("Our external IP: {ExternalIp}", externalIp);
+
+            // Step 2: Create UDP client for hole punching
+            using var udpClient = new UdpClient();
+            
+            // Bind to a specific port to ensure consistent NAT mapping
+            var localPort = 0; // Let OS assign a port
+            udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, localPort));
+            
+            var localEndpoint = udpClient.Client.LocalEndPoint as IPEndPoint;
+            _logger.LogDebug("Local UDP endpoint: {LocalEndpoint}", localEndpoint);
+
+            // Step 3: Perform simultaneous open
+            // In a real implementation, this would be coordinated through a rendezvous server
+            // Both peers would exchange their external endpoints and attempt to send simultaneously
+            
+            var remoteEndpoint = new IPEndPoint(remotePeer.IpAddress, remotePeer.Port);
+            
+            // Send initial packets to create NAT mapping
+            var success = await PerformSimultaneousOpenAsync(
+                udpClient, 
+                remoteEndpoint, 
+                ct).ConfigureAwait(false);
+
+            if (success)
+            {
+                _logger.LogInformation(
+                    "Successfully established UDP hole punch to {Peer}",
+                    remotePeer.Endpoint);
+                return true;
+            }
+
+            _logger.LogWarning(
+                "UDP hole punching failed to {Peer}, relay fallback required",
+                remotePeer.Endpoint);
+            
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error during UDP hole punching to {Peer}", remotePeer.Endpoint);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Performs the simultaneous open technique for UDP hole punching.
+    /// </summary>
+    /// <remarks>
+    /// The simultaneous open technique works as follows:
+    /// 
+    /// 1. Both peers send UDP packets to each other's external addresses at the same time
+    /// 2. These outgoing packets create temporary "holes" in the NAT mapping
+    /// 3. When the packets arrive, they can traverse the NAT because a mapping exists
+    /// 4. Subsequent packets can flow in both directions through these holes
+    /// 
+    /// This technique works with many (but not all) types of NAT:
+    /// - Full Cone NAT: Works perfectly
+    /// - Restricted Cone NAT: Works if timing is right
+    /// - Port Restricted Cone NAT: Works if timing is right
+    /// - Symmetric NAT: Usually fails (requires port prediction)
+    /// 
+    /// In a production system, this would be coordinated through a rendezvous server
+    ///  /// that helh peers synchronize their simultaneous sends.
+    /// </remarks>
+    private async Task<bool> PerformSimultaneousOpenAsync(
+        UdpClient udpClient,
+        IPEndPoint remoteEndpoint,
+        CancellationToken ct)
+    {
+        _logger.LogDebug("Starting simultaneous open to {RemoteEndpoint}", remoteEndpoint);
+
+        try
+        {
+            // Create a unique handshake message
+            var handshakeMessage = CreateHolePunchHandshake();
+            
+            // Send multiple packets to increase chances of success
+            // This compensates for packet loss and timing issues
+            const int maxAttempts = 5;
+            const int attemptDelayMs = 200;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                _logger.LogDebug(
+                    "Sending hole punch packet {Attempt}/{MaxAttempts} to {RemoteEndpoint}",
+                    attempt + 1, maxAttempts, remoteEndpoint);
+
+                // Send handshake packet
+                await udpClient.SendAsync(
+                    handshakeMessage, 
+                    handshakeMessage.Length, 
+                    remoteEndpoint).ConfigureAwait(false);
+
+                // Try to receive a response
+                var receiveTask = udpClient.ReceiveAsync();
+                var timeoutTask = Task.Delay(attemptDelayMs, ct);
+                var completedTask = await Task.WhenAny(receiveTask, timeoutTask).ConfigureAwait(false);
+
+                if (completedTask == receiveTask)
+                {
+                    var result = await receiveTask.ConfigureAwait(false);
+                    
+                    // Verify the response is a valid handshake
+                    if (IsValidHolePunchResponse(result.Buffer))
+                    {
+                        _logger.LogInformation(
+                            "Received valid hole punch response from {RemoteEndpoint}",
+                            result.RemoteEndPoint);
+
+                        // Send confirmation
+                        var confirmMessage = CreateHolePunchConfirmation();
+                        await udpClient.SendAsync(
+                            confirmMessage,
+                            confirmMessage.Length,
+                            remoteEndpoint).ConfigureAwait(false);
+
+                        return true;
+                    }
+                    else
+                    {
+                        _logger.LogDebug(
+                            "Received invalid hole punch response from {RemoteEndpoint}",
+                            result.RemoteEndPoint);
+                    }
+                }
+            }
+
+            _logger.LogWarning(
+                "Simultaneous open failed after {MaxAttempts} attempts to {RemoteEndpoint}",
+                maxAttempts, remoteEndpoint);
+            
+            return false;
+        }
+        catch (SocketException ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Socket error during simultaneous open to {RemoteEndpoint}",
+                remoteEndpoint);
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(
+                ex,
+                "Error during simultaneous open to {RemoteEndpoint}",
+                remoteEndpoint);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Creates a UDP hole punch handshake message.
+    /// </summary>
+    /// <remarks>
+    /// Format: [4 bytes: magic][4 bytes: timestamp][1 byte: message type]
+    /// 
+    /// Magic: 0x484F4C45 ("HOLE" in ASCII)
+    /// Timestamp: Unix timestamp in seconds
+    /// Message Type: 0x01 for handshake
+    /// </remarks>
+    private byte[] CreateHolePunchHandshake()
+    {
+        var message = new byte[9];
+        
+        // Magic number: "HOLE" in ASCII
+        message[0] = 0x48; // 'H'
+        message[1] = 0x4F; // 'O'
+        message[2] = 0x4C; // 'L'
+        message[3] = 0x45; // 'E'
+        
+        // Timestamp (4 bytes)
+        var timestamp = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var timestampBytes = BitConverter.GetBytes(timestamp);
+        if (BitConverter.IsLittleEndian)
+            Array.Reverse(timestampBytes);
+        Buffer.BlockCopy(timestampBytes, 0, message, 4, 4);
+        
+        // Message type: 0x01 for handshake
+        message[8] = 0x01;
+        
+        return message;
+    }
+
+    /// <summary>
+    /// Creates a UDP hole punch confirmation message.
+    /// </summary>
+    private byte[] CreateHolePunchConfirmation()
+    {
+        var message = new byte[9];
+        
+        // Magic number: "HOLE" in ASCII
+        message[0] = 0x48; // 'H'
+        message[1] = 0x4F; // 'O'
+        message[2] = 0x4C; // 'L'
+        message[3] = 0x45; // 'E'
+        
+        // Timestamp (4 bytes)
+        var timestamp = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var timestampBytes = BitConverter.GetBytes(timestamp);
+        if (BitConverter.IsLittleEndian)
+            Array.Reverse(timestampBytes);
+        Buffer.BlockCopy(timestampBytes, 0, message, 4, 4);
+        
+        // Message type: 0x02 for confirmation
+        message[8] = 0x02;
+        
+        return message;
+    }
+
+    /// <summary>
+    /// Validates a hole punch response message.
+    /// </summary>
+    private bool IsValidHolePunchResponse(byte[] message)
+    {
+        try
+        {
+            // Check minimum length
+            if (message.Length < 9)
+            {
+                _logger.LogDebug("Hole punch response too short: {Length} bytes", message.Length);
+                return false;
+            }
+
+            // Verify magic number
+            if (message[0] != 0x48 || message[1] != 0x4F || 
+                message[2] != 0x4C || message[3] != 0x45)
+            {
+                _logger.LogDebug("Invalid magic number in hole punch response");
+                return false;
+            }
+
+            // Extract timestamp
+            var timestampBytes = new byte[4];
+            Buffer.BlockCopy(message, 4, timestampBytes, 0, 4);
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(timestampBytes);
+            var timestamp = BitConverter.ToUInt32(timestampBytes, 0);
+
+            // Verify timestamp is recent (within 30 seconds)
+            var currentTimestamp = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var timeDiff = Math.Abs((int)(currentTimestamp - timestamp));
+            
+            if (timeDiff > 30)
+            {
+                _logger.LogDebug(
+                    "Hole punch response timestamp too old: {TimeDiff} seconds",
+                    timeDiff);
+                return false;
+            }
+
+            // Check message type (should be handshake or confirmation)
+            var messageType = message[8];
+            if (messageType != 0x01 && messageType != 0x02)
+            {
+                _logger.LogDebug(
+                    "Invalid message type in hole punch response: 0x{MessageType:X2}",
+                    messageType);
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error validating hole punch response");
+            return false;
+        }
     }
 
     private async Task<IPAddress?> QueryStunServerAsync(string host, int port, CancellationToken ct)

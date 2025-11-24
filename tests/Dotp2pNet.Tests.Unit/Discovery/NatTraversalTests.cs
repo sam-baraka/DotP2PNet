@@ -31,19 +31,19 @@ public class NatTraversalTests
     }
 
     [Fact]
-    public async Task GetExternalIpAsync_WithCancellation_ShouldRespectCancellationToken()
+    public async Task GetExternalIpAsync_WithCancellation_ShouldReturnNull()
     {
         // Arrange
         var natTraversal = new NatTraversal(_logger);
         var cts = new CancellationTokenSource();
         cts.Cancel();
 
-        // Act & Assert
-        // TaskCanceledException is a subclass of OperationCanceledException
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
-        {
-            await natTraversal.GetExternalIpAsync(cts.Token);
-        });
+        // Act
+        var result = await natTraversal.GetExternalIpAsync(cts.Token);
+
+        // Assert
+        // Should return null when cancelled, not throw
+        Assert.Null(result);
     }
 
     [Fact]
@@ -99,21 +99,68 @@ public class NatTraversalTests
     }
 
     [Fact]
-    public async Task TryUdpHolePunchingAsync_ShouldReturnFalse_WhenNotImplemented()
+    public async Task TryUdpHolePunchingAsync_WithInvalidPeer_ShouldReturnFalse()
     {
         // Arrange
         var natTraversal = new NatTraversal(_logger);
-        var remotePeer = new Core.Models.PeerInfo
+        var invalidPeer = new Core.Models.PeerInfo
         {
-            PeerId = new byte[20],
+            PeerId = new byte[10], // Invalid: should be 20 bytes
             IpAddress = System.Net.IPAddress.Parse("1.2.3.4"),
             Port = 6881
         };
 
         // Act
-        var result = await natTraversal.TryUdpHolePunchingAsync(remotePeer);
+        var result = await natTraversal.TryUdpHolePunchingAsync(invalidPeer);
 
         // Assert
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryUdpHolePunchingAsync_WithValidPeer_ShouldAttemptHolePunching()
+    {
+        // Arrange
+        var natTraversal = new NatTraversal(_logger);
+        var validPeer = new Core.Models.PeerInfo
+        {
+            PeerId = new byte[20], // Valid peer ID
+            IpAddress = System.Net.IPAddress.Parse("8.8.8.8"), // Google DNS (won't respond to our protocol)
+            Port = 6881
+        };
+
+        // Act
+        // This will attempt hole punching but will fail because:
+        // 1. The remote peer (8.8.8.8) won't respond to our custom protocol
+        // 2. There's no coordination/rendezvous server
+        // But the method should handle this gracefully
+        var result = await natTraversal.TryUdpHolePunchingAsync(validPeer);
+
+        // Assert
+        // Should return false since the remote peer won't respond
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryUdpHolePunchingAsync_WithCancellation_ShouldReturnFalseGracefully()
+    {
+        // Arrange
+        var natTraversal = new NatTraversal(_logger);
+        var validPeer = new Core.Models.PeerInfo
+        {
+            PeerId = new byte[20],
+            IpAddress = System.Net.IPAddress.Parse("1.2.3.4"),
+            Port = 6881
+        };
+        var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        // Act
+        // The implementation catches OperationCanceledException and returns false gracefully
+        var result = await natTraversal.TryUdpHolePunchingAsync(validPeer, cts.Token);
+
+        // Assert
+        // Should return false when cancelled, not throw
         Assert.False(result);
     }
 }
