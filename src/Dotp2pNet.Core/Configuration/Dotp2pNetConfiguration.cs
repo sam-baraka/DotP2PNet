@@ -130,6 +130,21 @@ public class PeerConfiguration
     public int RequestTimeoutSeconds { get; set; } = 30;
 
     /// <summary>
+    /// Peer inactivity timeout in seconds (2 minutes default).
+    /// </summary>
+    public int InactivityTimeoutSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// Maximum number of connection retry attempts.
+    /// </summary>
+    public int MaxConnectionRetries { get; set; } = 3;
+
+    /// <summary>
+    /// Initial retry delay in milliseconds for exponential backoff.
+    /// </summary>
+    public int RetryInitialDelayMs { get; set; } = 1000;
+
+    /// <summary>
     /// Enable choking algorithm (bandwidth management).
     /// </summary>
     public bool EnableChoking { get; set; } = true;
